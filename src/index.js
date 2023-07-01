@@ -41,6 +41,7 @@ const retryFetch = async (url, options) => {
   let lastError;
   for (let i = 0; i < 2; i++) {
     try {
+      options.headers['x-api-key'] = randomChoice(api_keys);
       const response = await fetch(url, options);
       if ([401, 429].includes(response.status)) {
         lastError = response;
