@@ -6,7 +6,7 @@ import fetch from 'node-fetch';
 
 const port = parseInt(process.env.PORT || '8080', 10);
 const api_keys = JSON.parse(process.env.API_KEYS);
-const upstreamUrl = 'https://api.openai.com/v1/chat/completions';
+const upstreamUrl = 'https://api.anthropic.com/v1/complete';
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -16,7 +16,43 @@ const corsHeaders = {
 
 const randomChoice = (arr) => arr[Math.floor(Math.random() * arr.length)];
 
-const obfuscateOpenAIResponse = (text) => text.replace(/\borg-[a-zA-Z0-9]{24}\b/g, 'org-************************').replace(' Please add a payment method to your account to increase your rate limit. Visit https://platform.openai.com/account/billing to add a payment method.', '');
+function filterRequestBody(body) {
+  // List of allowed main keys
+  const allowedMainKeys = ["metadata", "model", "prompt", "max_tokens_to_sample", "temperature", "top_p", "top_k", "stream"];
+
+  // Filter main keys
+  let filteredBody = Object.keys(body)
+    .filter(key => allowedMainKeys.includes(key))
+    .reduce((obj, key) => {
+      obj[key] = body[key];
+      return obj;
+    }, {});
+
+  // Filter metadata to only keep 'user_id'
+  if (filteredBody.metadata && filteredBody.metadata.user_id) {
+    let filteredMetadata = { user_id: filteredBody.metadata.user_id };
+    filteredBody.metadata = filteredMetadata;
+  }
+
+  return filteredBody;
+}
+
+const retryFetch = async (url, options) => {
+  let lastError;
+  for (let i = 0; i < 2; i++) {
+    try {
+      const response = await fetch(url, options);
+      if ([401, 429].includes(response.status)) {
+        lastError = response;
+      } else {
+        return response;
+      }
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError;
+};
 
 const app = express();
 app.disable('etag');
@@ -46,25 +82,31 @@ const handlePost = async (req, res) => {
   }
 
   try {
-    const authHeader = req.get('Authorization');
-    const authHeaderUpstream = authHeader || `Bearer ${randomChoice(api_keys)}`;
+    const authHeader = req.get('x-api-key');
+    if (authHeader !== process.env.PROXY_KEY) {
+      return res.status(401).set(corsHeaders).type('text/plain').send('Unauthorized.');
+    }
+    const authHeaderUpstream = randomChoice(api_keys);
 
     const requestHeader = {
+      'Accept': 'application/json',
       'Content-Type': 'application/json',
-      'Authorization': authHeaderUpstream,
-      'User-Agent': 'curl/7.64.1',
+      'x-api-key': authHeaderUpstream,
+      'User-Agent': 'Anthropic/Python 0.3.1',
+      'anthropic-version': '2023-06-01'
     };
-    const resUpstream = await fetch(upstreamUrl, {
+    let filteredBody = filterRequestBody(req.body);
+
+    const resUpstream = await retryFetch(upstreamUrl, {
       method: 'POST',
       headers: requestHeader,
-      body: JSON.stringify(req.body),
+      body: JSON.stringify(filteredBody),
     });
 
     if (!resUpstream.ok) {
       const { status } = resUpstream;
       const text = await resUpstream.text();
-      const textObfuscated = obfuscateOpenAIResponse(text);
-      return res.status(status).set(corsHeaders).type('text/plain').send(`OpenAI API responded:\n\n${textObfuscated}`);
+      return res.status(status).set(corsHeaders).type('text/plain').send(text);
     }
 
     const contentType = resUpstream.headers.get('content-type');
@@ -89,10 +131,8 @@ const handlePost = async (req, res) => {
   }
 };
 
-app.options('/v1/', handleOptions);
-app.post('/v1/', handlePost);
-app.options('/v1/chat/completions', handleOptions);
-app.post('/v1/chat/completions', handlePost);
+app.options('/v1/complete', handleOptions);
+app.post('/v1/complete', handlePost);
 
 app.use('*', (req, res) => {
   res.status(404).set(corsHeaders).type('text/plain').send('Not found');
